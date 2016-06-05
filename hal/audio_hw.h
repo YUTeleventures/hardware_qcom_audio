@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2014, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2013-2015, The Linux Foundation. All rights reserved.
  * Not a contribution.
  *
  * Copyright (C) 2013 The Android Open Source Project
@@ -38,6 +38,7 @@
 #ifndef QCOM_AUDIO_HW_H
 #define QCOM_AUDIO_HW_H
 
+#include <stdlib.h>
 #include <cutils/list.h>
 #include <hardware/audio_amplifier.h>
 #include <hardware/audio.h>
@@ -50,6 +51,7 @@
 
 #define VISUALIZER_LIBRARY_PATH "/system/lib/soundfx/libqcomvisualizer.so"
 #define OFFLOAD_EFFECTS_BUNDLE_LIBRARY_PATH "/system/lib/soundfx/libqcompostprocbundle.so"
+#define ADM_LIBRARY_PATH "/system/vendor/lib/libadm.so"
 
 /* Flags used to initialize acdb_settings variable that goes to ACDB library */
 #define NONE_FLAG            0x00000000
@@ -94,6 +96,9 @@ enum {
     USECASE_AUDIO_PLAYBACK_OFFLOAD8,
     USECASE_AUDIO_PLAYBACK_OFFLOAD9,
 #endif
+    USECASE_AUDIO_PLAYBACK_ULL,
+
+    USECASE_AUDIO_DIRECT_PCM_OFFLOAD,
 
     /* FM usecase */
     USECASE_AUDIO_PLAYBACK_FM,
@@ -107,6 +112,7 @@ enum {
     USECASE_AUDIO_RECORD_COMPRESS,
     USECASE_AUDIO_RECORD_LOW_LATENCY,
     USECASE_AUDIO_RECORD_FM_VIRTUAL,
+    USECASE_AUDIO_RECORD_3MIC_SSR,
 
     /* Voice usecase */
     USECASE_VOICE_CALL,
@@ -178,6 +184,7 @@ struct stream_app_type_cfg {
 struct stream_out {
     struct audio_stream_out stream;
     pthread_mutex_t lock; /* see note below on mutex acquisition order */
+    pthread_mutex_t pre_lock; /* acquire before lock to avoid DOS by playback thread */
     pthread_cond_t  cond;
     struct pcm_config config;
     struct compr_config compr_config;
@@ -212,6 +219,8 @@ struct stream_out {
     void *offload_cookie;
     struct compr_gapless_mdata gapless_mdata;
     int send_new_metadata;
+    bool send_next_track_params;
+    bool is_compr_metadata_avail;
     unsigned int bit_width;
 
     struct audio_device *dev;
@@ -220,6 +229,7 @@ struct stream_out {
 struct stream_in {
     struct audio_stream_in stream;
     pthread_mutex_t lock; /* see note below on mutex acquisition order */
+    pthread_mutex_t pre_lock; /* acquire before lock to avoid DOS by playback thread */
     struct pcm_config config;
     struct pcm *pcm;
     int standby;
@@ -232,6 +242,7 @@ struct stream_in {
     bool enable_ns;
     audio_format_t format;
     audio_io_handle_t capture_handle;
+    audio_input_flags_t flags;
     bool is_st_session;
     bool is_st_session_active;
 
@@ -284,6 +295,14 @@ struct streams_output_cfg {
     struct stream_app_type_cfg app_type_cfg;
 };
 
+typedef void* (*adm_init_t)();
+typedef void (*adm_deinit_t)(void *);
+typedef void (*adm_register_output_stream_t)(void *, audio_io_handle_t, audio_output_flags_t);
+typedef void (*adm_register_input_stream_t)(void *, audio_io_handle_t, audio_input_flags_t);
+typedef void (*adm_deregister_stream_t)(void *, audio_io_handle_t);
+typedef void (*adm_request_focus_t)(void *, audio_io_handle_t);
+typedef void (*adm_abandon_focus_t)(void *, audio_io_handle_t);
+
 struct audio_device {
     struct audio_hw_device device;
     pthread_mutex_t lock; /* see note below on mutex acquisition order */
@@ -321,7 +340,18 @@ struct audio_device {
 
     struct sound_card_status snd_card_status;
     int (*offload_effects_set_hpx_state)(bool);
+
     amplifier_device_t *amp;
+
+    void *adm_data;
+    void *adm_lib;
+    adm_init_t adm_init;
+    adm_deinit_t adm_deinit;
+    adm_register_input_stream_t adm_register_input_stream;
+    adm_register_output_stream_t adm_register_output_stream;
+    adm_deregister_stream_t adm_deregister_stream;
+    adm_request_focus_t adm_request_focus;
+    adm_abandon_focus_t adm_abandon_focus;
 };
 
 int select_devices(struct audio_device *adev,
