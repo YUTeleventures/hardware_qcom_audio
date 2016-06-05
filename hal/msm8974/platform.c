@@ -229,12 +229,18 @@ static int pcm_device_table[AUDIO_USECASE_MAX][2] = {
     [USECASE_AUDIO_PLAYBACK_OFFLOAD9] =
                      {PLAYBACK_OFFLOAD_DEVICE9, PLAYBACK_OFFLOAD_DEVICE9},
 #endif
+
+    [USECASE_AUDIO_DIRECT_PCM_OFFLOAD] =
+                     {PLAYBACK_OFFLOAD_DEVICE2, PLAYBACK_OFFLOAD_DEVICE2},
+
     [USECASE_AUDIO_RECORD] = {AUDIO_RECORD_PCM_DEVICE, AUDIO_RECORD_PCM_DEVICE},
     [USECASE_AUDIO_RECORD_COMPRESS] = {COMPRESS_CAPTURE_DEVICE, COMPRESS_CAPTURE_DEVICE},
     [USECASE_AUDIO_RECORD_LOW_LATENCY] = {LOWLATENCY_PCM_DEVICE,
                                           LOWLATENCY_PCM_DEVICE},
     [USECASE_AUDIO_RECORD_FM_VIRTUAL] = {MULTIMEDIA2_PCM_DEVICE,
                                   MULTIMEDIA2_PCM_DEVICE},
+    [USECASE_AUDIO_RECORD_3MIC_SSR] = {AUDIO_RECORD_3MIC_PCM_DEVICE,
+                                  AUDIO_RECORD_3MIC_PCM_DEVICE},
     [USECASE_AUDIO_PLAYBACK_FM] = {FM_PLAYBACK_PCM_DEVICE, FM_CAPTURE_PCM_DEVICE},
     [USECASE_AUDIO_HFP_SCO] = {HFP_PCM_RX, HFP_SCO_RX},
     [USECASE_AUDIO_HFP_SCO_WB] = {HFP_PCM_RX, HFP_SCO_RX},
@@ -364,6 +370,7 @@ static char * device_table[SND_DEVICE_MAX] = {
     [SND_DEVICE_IN_SPEAKER_QMIC_AEC] = "quad-mic",
     [SND_DEVICE_IN_SPEAKER_QMIC_NS] = "quad-mic",
     [SND_DEVICE_IN_SPEAKER_QMIC_AEC_NS] = "quad-mic",
+    [SND_DEVICE_IN_SSR_3MIC] = "three-mic",
 };
 
 // Platform specific backend bit width table
@@ -461,6 +468,7 @@ static int acdb_device_table[SND_DEVICE_MAX] = {
     [SND_DEVICE_IN_SPEAKER_QMIC_AEC] = 126,
     [SND_DEVICE_IN_SPEAKER_QMIC_NS] = 127,
     [SND_DEVICE_IN_SPEAKER_QMIC_AEC_NS] = 129,
+    [SND_DEVICE_IN_SSR_3MIC] = 46,
 };
 
 struct name_to_index {
@@ -576,6 +584,7 @@ static struct name_to_index usecase_name_index[AUDIO_USECASE_MAX] = {
     {TO_NAME_INDEX(USECASE_AUDIO_PLAYBACK_OFFLOAD8)},
     {TO_NAME_INDEX(USECASE_AUDIO_PLAYBACK_OFFLOAD9)},
 #endif
+    {TO_NAME_INDEX(USECASE_AUDIO_DIRECT_PCM_OFFLOAD)},
     {TO_NAME_INDEX(USECASE_AUDIO_RECORD)},
     {TO_NAME_INDEX(USECASE_AUDIO_RECORD_LOW_LATENCY)},
     {TO_NAME_INDEX(USECASE_VOICE_CALL)},
@@ -2034,11 +2043,16 @@ snd_device_t platform_get_input_snd_device(void *platform, audio_devices_t out_d
         if (in_device & AUDIO_DEVICE_IN_BUILTIN_MIC) {
             if (channel_count == 2) {
                 snd_device = SND_DEVICE_IN_VOICE_REC_DMIC_STEREO;
-            } else if (adev->active_input->enable_ns)
-                snd_device = SND_DEVICE_IN_VOICE_REC_MIC_NS;
-            else if (my_data->fluence_type != FLUENCE_NONE &&
+            } else if (my_data->fluence_type != FLUENCE_NONE &&
                      my_data->fluence_in_voice_rec) {
-                snd_device = SND_DEVICE_IN_VOICE_REC_DMIC_FLUENCE;
+                if (my_data->fluence_type & FLUENCE_QUAD_MIC) {
+                    snd_device = SND_DEVICE_IN_HANDSET_QMIC;
+                } else {
+                    snd_device = SND_DEVICE_IN_VOICE_REC_DMIC_FLUENCE;
+                }
+                platform_set_echo_reference(adev->platform, true);
+            } else if (adev->active_input->enable_ns) {
+                snd_device = SND_DEVICE_IN_VOICE_REC_MIC_NS;
             } else {
                 snd_device = SND_DEVICE_IN_VOICE_REC_MIC;
             }
@@ -2131,12 +2145,27 @@ snd_device_t platform_get_input_snd_device(void *platform, audio_devices_t out_d
             }
         }
     } else if (source == AUDIO_SOURCE_FM_RX ||
-               source == AUDIO_SOURCE_FM_RX_A2DP) {
+               source == AUDIO_SOURCE_FM_RX_A2DP||
+               source == AUDIO_SOURCE_FM_TUNER) {
         snd_device = SND_DEVICE_IN_CAPTURE_FM;
     } else if (source == AUDIO_SOURCE_DEFAULT) {
         goto exit;
     }
 
+
+    if((audio_extn_ssr_get_enabled()) && (channel_count == 2) &&
+             ((AUDIO_SOURCE_MIC == source) || (AUDIO_SOURCE_CAMCORDER == source))) {
+        //TODO:: check whether SSR mode is on or not
+        //Force input from 3 mic
+        snd_device = SND_DEVICE_IN_SSR_3MIC;
+    }
+
+    if((audio_extn_ssr_get_enabled()) && (channel_count == 2) &&
+             ((AUDIO_SOURCE_MIC == source) || (AUDIO_SOURCE_CAMCORDER == source))) {
+        //TODO:: check whether SSR mode is on or not
+        //Force input from 3 mic
+        snd_device = SND_DEVICE_IN_SSR_3MIC;
+    }
 
     if (snd_device != SND_DEVICE_NONE) {
         goto exit;
@@ -2174,7 +2203,8 @@ snd_device_t platform_get_input_snd_device(void *platform, audio_devices_t out_d
         } else if (in_device & AUDIO_DEVICE_IN_ANLG_DOCK_HEADSET ||
                    in_device & AUDIO_DEVICE_IN_DGTL_DOCK_HEADSET) {
             snd_device = SND_DEVICE_IN_USB_HEADSET_MIC;
-        } else if (in_device & AUDIO_DEVICE_IN_FM_RX) {
+        } else if (in_device & AUDIO_DEVICE_IN_FM_RX ||
+                   in_device & AUDIO_DEVICE_IN_FM_TUNER) {
             snd_device = SND_DEVICE_IN_CAPTURE_FM;
         } else {
             ALOGE("%s: Unknown input device(s) %#x", __func__, in_device);
@@ -2843,9 +2873,16 @@ int64_t platform_render_latency(audio_usecase_t usecase)
 int platform_update_usecase_from_source(int source, int usecase)
 {
     ALOGV("%s: input source :%d", __func__, source);
-    if(source == AUDIO_SOURCE_FM_RX_A2DP)
-        usecase = USECASE_AUDIO_RECORD_FM_VIRTUAL;
-    return usecase;
+    switch(source) {
+        case AUDIO_SOURCE_VOICE_UPLINK:
+            return USECASE_INCALL_REC_UPLINK;
+        case AUDIO_SOURCE_VOICE_DOWNLINK:
+            return USECASE_INCALL_REC_DOWNLINK;
+        case AUDIO_SOURCE_VOICE_CALL:
+            return USECASE_INCALL_REC_UPLINK_AND_DOWNLINK;
+        default:
+            return usecase;
+    }
 }
 
 bool platform_listen_device_needs_event(snd_device_t snd_device)
@@ -2931,7 +2968,7 @@ uint32_t platform_get_pcm_offload_buffer_size(audio_offload_info_t* info)
         bits_per_sample = 32;
     }
 
-    if (info->use_small_bufs) {
+    if (platform_use_small_buffer(info)) {
         pcm_offload_time = PCM_OFFLOAD_BUFFER_DURATION_FOR_SMALL_BUFFERS;
     } else {
         if (!info->has_video) {
@@ -2962,6 +2999,11 @@ uint32_t platform_get_pcm_offload_buffer_size(audio_offload_info_t* info)
 
     ALOGI("PCM offload Fragment size to %d bytes", fragment_size);
     return fragment_size;
+}
+
+bool platform_use_small_buffer(audio_offload_info_t* info)
+{
+    return OFFLOAD_USE_SMALL_BUFFER;
 }
 
 int platform_set_codec_backend_cfg(struct audio_device* adev,
