@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2015, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2013-2016, The Linux Foundation. All rights reserved.
  * Not a contribution.
  *
  * Copyright (C) 2013 The Android Open Source Project
@@ -74,6 +74,8 @@
 
 #define SND_CARD_STATE_OFFLINE 0
 #define SND_CARD_STATE_ONLINE 1
+
+#define MAX_PERF_LOCK_OPTS 20
 
 /* These are the supported use cases by the hardware.
  * Each usecase is mapped to a specific PCM device.
@@ -352,6 +354,9 @@ struct audio_device {
     adm_deregister_stream_t adm_deregister_stream;
     adm_request_focus_t adm_request_focus;
     adm_abandon_focus_t adm_abandon_focus;
+    int perf_lock_handle;
+    int perf_lock_opts[MAX_PERF_LOCK_OPTS];
+    int perf_lock_opts_size;
 };
 
 int select_devices(struct audio_device *adev,
@@ -366,7 +371,7 @@ int enable_snd_device(struct audio_device *adev,
 int enable_audio_route(struct audio_device *adev,
                        struct audio_usecase *usecase);
 
-struct audio_usecase *get_usecase_from_list(struct audio_device *adev,
+struct audio_usecase *get_usecase_from_list(const struct audio_device *adev,
                                                    audio_usecase_t uc_id);
 
 bool is_offload_usecase(audio_usecase_t uc_id);

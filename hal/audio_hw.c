@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2015, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2013-2016, The Linux Foundation. All rights reserved.
  * Not a Contribution.
  *
  * Copyright (C) 2013 The Android Open Source Project
@@ -253,8 +253,6 @@ static const struct string_to_enum out_formats_name_to_enum_table[] = {
 static struct audio_device *adev = NULL;
 static pthread_mutex_t adev_init_lock;
 static unsigned int audio_device_ref_count;
-
-static int set_voice_volume_l(struct audio_device *adev, float volume);
 
 static amplifier_device_t * get_amplifier_device(void)
 {
@@ -589,6 +587,8 @@ int enable_snd_device(struct audio_device *adev,
                       snd_device_t snd_device)
 {
     char device_name[DEVICE_NAME_MAX_SIZE] = {0};
+    int i, num_devices = 0;
+    snd_device_t new_snd_devices[2];
 
     if (snd_device < SND_DEVICE_MIN ||
         snd_device >= SND_DEVICE_MAX) {
@@ -632,6 +632,10 @@ int enable_snd_device(struct audio_device *adev,
             audio_extn_dev_arbi_release(snd_device);
             return -EINVAL;
         }
+    } else if (platform_can_split_snd_device(snd_device, &num_devices, new_snd_devices)) {
+        for (i = 0; i < num_devices; i++) {
+            enable_snd_device(adev, new_snd_devices[i]);
+        }
     } else {
         ALOGD("%s: snd_device(%d: %s)", __func__, snd_device, device_name);
         /* due to the possibility of calibration overwrite between listen
@@ -659,6 +663,8 @@ int disable_snd_device(struct audio_device *adev,
                        snd_device_t snd_device)
 {
     char device_name[DEVICE_NAME_MAX_SIZE] = {0};
+    int i, num_devices = 0;
+    snd_device_t new_snd_devices[2];
 
     if (snd_device < SND_DEVICE_MIN ||
         snd_device >= SND_DEVICE_MAX) {
@@ -692,6 +698,10 @@ int disable_snd_device(struct audio_device *adev,
             snd_device == SND_DEVICE_OUT_VOICE_SPEAKER) &&
             audio_extn_spkr_prot_is_enabled()) {
             audio_extn_spkr_prot_stop_processing(snd_device);
+        } else if (platform_can_split_snd_device(snd_device, &num_devices, new_snd_devices)) {
+            for (i = 0; i < num_devices; i++) {
+                disable_snd_device(adev, new_snd_devices[i]);
+            }
         } else {
             audio_route_reset_and_update_path(adev->audio_route, device_name);
             amplifier_enable_devices(snd_device, false);
@@ -707,9 +717,9 @@ int disable_snd_device(struct audio_device *adev,
     return 0;
 }
 
-static void check_usecases_codec_backend(struct audio_device *adev,
-                                          struct audio_usecase *uc_info,
-                                          snd_device_t snd_device)
+static void check_and_route_playback_usecases(struct audio_device *adev,
+                                              struct audio_usecase *uc_info,
+                                              snd_device_t snd_device)
 {
     struct listnode *node;
     struct audio_usecase *usecase;
@@ -745,7 +755,8 @@ static void check_usecases_codec_backend(struct audio_device *adev,
         if (usecase->type != PCM_CAPTURE &&
                 usecase != uc_info &&
                 (usecase->out_snd_device != snd_device || force_routing)  &&
-                usecase->devices & AUDIO_DEVICE_OUT_ALL_CODEC_BACKEND) {
+                usecase->devices & AUDIO_DEVICE_OUT_ALL_CODEC_BACKEND &&
+                platform_check_backends_match(snd_device, usecase->out_snd_device)) {
             ALOGV("%s: Usecase (%s) is active on (%s) - disabling ..",
                   __func__, use_case_table[usecase->id],
                   platform_get_snd_device_name(usecase->out_snd_device));
@@ -896,7 +907,7 @@ static int read_hdmi_channel_masks(struct stream_out *out)
     return ret;
 }
 
-static audio_usecase_t get_voice_usecase_id_from_list(struct audio_device *adev)
+static audio_usecase_t get_voice_usecase_id_from_list(const struct audio_device *adev)
 {
     struct audio_usecase *usecase;
     struct listnode *node;
@@ -911,7 +922,7 @@ static audio_usecase_t get_voice_usecase_id_from_list(struct audio_device *adev)
     return USECASE_INVALID;
 }
 
-struct audio_usecase *get_usecase_from_list(struct audio_device *adev,
+struct audio_usecase *get_usecase_from_list(const struct audio_device *adev,
                                             audio_usecase_t uc_id)
 {
     struct audio_usecase *usecase;
@@ -934,7 +945,6 @@ int select_devices(struct audio_device *adev, audio_usecase_t uc_id)
     struct audio_usecase *voip_usecase = NULL;
     struct audio_usecase *hfp_usecase = NULL;
     audio_usecase_t hfp_ucid;
-    struct listnode *node;
     int status = 0;
 
     usecase = get_usecase_from_list(adev, uc_id);
@@ -956,7 +966,7 @@ int select_devices(struct audio_device *adev, audio_usecase_t uc_id)
          * so that it would not result any device switch. All the usecases will
          * be switched to new device when select_devices() is called for voice call
          * usecase. This is to avoid switching devices for voice call when
-         * check_usecases_codec_backend() is called below.
+         * check_and_route_playback_usecases() is called below.
          */
         if (voice_is_in_call(adev) && adev->mode == AUDIO_MODE_IN_CALL) {
             vc_usecase = get_usecase_from_list(adev,
@@ -1000,7 +1010,8 @@ int select_devices(struct audio_device *adev, audio_usecase_t uc_id)
             out_snd_device = SND_DEVICE_NONE;
             if (in_snd_device == SND_DEVICE_NONE) {
                 audio_devices_t out_device = AUDIO_DEVICE_NONE;
-                if (adev->active_input->source == AUDIO_SOURCE_VOICE_COMMUNICATION &&
+                if (adev->active_input &&
+                        adev->active_input->source == AUDIO_SOURCE_VOICE_COMMUNICATION &&
                         adev->primary_output && !adev->primary_output->standby) {
                     out_device = adev->primary_output->devices;
                     platform_set_echo_reference(adev->platform, false);
@@ -1067,7 +1078,7 @@ int select_devices(struct audio_device *adev, audio_usecase_t uc_id)
     /* Enable new sound devices */
     if (out_snd_device != SND_DEVICE_NONE) {
         if (usecase->devices & AUDIO_DEVICE_OUT_ALL_CODEC_BACKEND)
-            check_usecases_codec_backend(adev, usecase, out_snd_device);
+            check_and_route_playback_usecases(adev, usecase, out_snd_device);
         enable_snd_device(adev, out_snd_device);
     }
 
@@ -1123,7 +1134,7 @@ int select_devices(struct audio_device *adev, audio_usecase_t uc_id)
 
 static int stop_input_stream(struct stream_in *in)
 {
-    int i, ret = 0;
+    int ret = 0;
     struct audio_usecase *uc_info;
     struct audio_device *adev = in->dev;
 
@@ -1216,7 +1227,9 @@ int start_input_stream(struct stream_in *in)
     uc_info->out_snd_device = SND_DEVICE_NONE;
 
     list_add_tail(&adev->usecase_list, &uc_info->list);
-    audio_extn_perf_lock_acquire();
+    audio_extn_perf_lock_acquire(&adev->perf_lock_handle, 0,
+                                 adev->perf_lock_opts,
+                                 adev->perf_lock_opts_size);
     select_devices(adev, in->usecase);
 
     ALOGV("%s: Opening PCM device card_id(%d) device_id(%d), channels %d",
@@ -1258,16 +1271,14 @@ int start_input_stream(struct stream_in *in)
         goto error_open;
     }
 
-    audio_extn_perf_lock_release();
-
+    audio_extn_perf_lock_release(&adev->perf_lock_handle);
     ALOGD("%s: exit", __func__);
 
     return ret;
 
 error_open:
+    audio_extn_perf_lock_release(&adev->perf_lock_handle);
     stop_input_stream(in);
-    audio_extn_perf_lock_release();
-
 error_config:
     adev->active_input = NULL;
     ALOGD("%s: exit: status(%d)", __func__, ret);
@@ -1590,7 +1601,7 @@ static int check_and_set_hdmi_channels(struct audio_device *adev,
 
 static int stop_output_stream(struct stream_out *out)
 {
-    int i, ret = 0;
+    int ret = 0;
     struct audio_usecase *uc_info;
     struct audio_device *adev = out->dev;
 
@@ -1712,6 +1723,9 @@ int start_output_stream(struct stream_out *out)
     }
     list_add_tail(&adev->usecase_list, &uc_info->list);
 
+    audio_extn_perf_lock_acquire(&adev->perf_lock_handle, 0,
+                                 adev->perf_lock_opts,
+                                 adev->perf_lock_opts_size);
     select_devices(adev, out->usecase);
 
     ALOGV("%s: Opening PCM device card_id(%d) device_id(%d) format(%#x)",
@@ -1802,11 +1816,12 @@ int start_output_stream(struct stream_out *out)
             audio_extn_check_and_set_dts_hpx_state(adev);
         }
     }
-
+    audio_extn_perf_lock_release(&adev->perf_lock_handle);
     ALOGD("%s: exit", __func__);
 
     return 0;
 error_open:
+    audio_extn_perf_lock_release(&adev->perf_lock_handle);
     stop_output_stream(out);
 error_config:
     return ret;
@@ -2024,12 +2039,9 @@ static int out_set_parameters(struct audio_stream *stream, const char *kvpairs)
 {
     struct stream_out *out = (struct stream_out *)stream;
     struct audio_device *adev = out->dev;
-    struct audio_usecase *usecase;
-    struct listnode *node;
     struct str_parms *parms;
     char value[32];
     int ret = 0, val = 0, err;
-    bool select_new_device = false;
 
     ALOGD("%s: enter: usecase(%d: %s) kvpairs: %s",
           __func__, out->usecase, use_case_table[out->usecase], kvpairs);
@@ -2059,7 +2071,7 @@ static int out_set_parameters(struct audio_stream *stream, const char *kvpairs)
 
         /*
          * select_devices() call below switches all the usecases on the same
-         * backend to the new device. Refer to check_usecases_codec_backend() in
+         * backend to the new device. Refer to check_and_route_playback_usecases() in
          * the select_devices(). But how do we undo this?
          *
          * For example, music playback is active on headset (deep-buffer usecase)
@@ -2125,7 +2137,7 @@ static char* out_get_parameters(const struct audio_stream *stream, const char *k
 {
     struct stream_out *out = (struct stream_out *)stream;
     struct str_parms *query = str_parms_create_str(keys);
-    char *str;
+    char *str = (char*) NULL;
     char value[256];
     struct str_parms *reply = str_parms_create();
     size_t i, j;
@@ -2133,6 +2145,12 @@ static char* out_get_parameters(const struct audio_stream *stream, const char *k
     bool first = true;
 
     if (!query || !reply) {
+        if (reply) {
+            str_parms_destroy(reply);
+        }
+        if (query) {
+            str_parms_destroy(query);
+        }
         ALOGE("out_get_parameters: failed to allocate mem for query or reply");
         return NULL;
     }
@@ -2172,12 +2190,14 @@ static char* out_get_parameters(const struct audio_stream *stream, const char *k
         value[0] = '\0';
         if (out->flags & AUDIO_OUTPUT_FLAG_DIRECT_PCM) {
             ALOGV("in direct_pcm");
-            strlcat(value, "true", strlen("true"));
+            strlcat(value, "true", sizeof(value ));
         } else {
             ALOGV("not in direct_pcm");
-            strlcat(value, "false", strlen("false"));
+            strlcat(value, "false", sizeof(value));
         }
         str_parms_add_str(reply, "is_direct_pcm_track", value);
+        if (str)
+            free(str);
         str = str_parms_to_str(reply);
     }
 
@@ -2200,6 +2220,8 @@ static char* out_get_parameters(const struct audio_stream *stream, const char *k
             i++;
         }
         str_parms_add_str(reply, AUDIO_PARAMETER_STREAM_SUP_FORMATS, value);
+        if (str)
+            free(str);
         str = str_parms_to_str(reply);
     }
     str_parms_destroy(query);
@@ -2388,7 +2410,7 @@ exit:
 
     if (ret != 0) {
         if (out->pcm)
-            ALOGE("%s: error %ld - %s", __func__, ret, pcm_get_error(out->pcm));
+            ALOGE("%s: error %d, %s", __func__, (int)ret, pcm_get_error(out->pcm));
         if (out->usecase == USECASE_COMPRESS_VOIP_CALL) {
             pthread_mutex_lock(&adev->lock);
             voice_extn_compress_voip_close_output_stream(&out->stream.common);
@@ -2704,7 +2726,6 @@ static int in_set_parameters(struct audio_stream *stream, const char *kvpairs)
     struct stream_in *in = (struct stream_in *)stream;
     struct audio_device *adev = in->dev;
     struct str_parms *parms;
-    char *str;
     char value[32];
     int ret = 0, val = 0, err;
 
@@ -2747,7 +2768,6 @@ static int in_set_parameters(struct audio_stream *stream, const char *kvpairs)
         }
     }
 
-done:
     pthread_mutex_unlock(&adev->lock);
     pthread_mutex_unlock(&in->lock);
 
@@ -2763,10 +2783,15 @@ static char* in_get_parameters(const struct audio_stream *stream,
     struct stream_in *in = (struct stream_in *)stream;
     struct str_parms *query = str_parms_create_str(keys);
     char *str;
-    char value[256];
     struct str_parms *reply = str_parms_create();
 
     if (!query || !reply) {
+        if (reply) {
+            str_parms_destroy(reply);
+        }
+        if (query) {
+            str_parms_destroy(query);
+        }
         ALOGE("in_get_parameters: failed to create query or reply");
         return NULL;
     }
@@ -2794,7 +2819,7 @@ static ssize_t in_read(struct audio_stream_in *stream, void *buffer,
 {
     struct stream_in *in = (struct stream_in *)stream;
     struct audio_device *adev = in->dev;
-    int i, ret = -1;
+    int ret = -1;
     int snd_scard_state = get_snd_card_state(adev);
 
     lock_input_stream(in);
@@ -2956,7 +2981,7 @@ static int adev_open_output_stream(struct audio_hw_device *dev,
 {
     struct audio_device *adev = (struct audio_device *)dev;
     struct stream_out *out;
-    int i, ret = 0;
+    int ret = 0;
     audio_format_t format;
 
     *stream_out = NULL;
@@ -3083,6 +3108,7 @@ static int adev_open_output_stream(struct audio_hw_device *dev,
             out->stream.drain = out_drain;
             out->stream.flush = out_flush;
         }
+
         if (config->offload_info.channel_mask)
             out->channel_mask = config->offload_info.channel_mask;
         else if (config->channel_mask) {
@@ -3357,7 +3383,6 @@ static int adev_set_parameters(struct audio_hw_device *dev, const char *kvpairs)
 {
     struct audio_device *adev = (struct audio_device *)dev;
     struct str_parms *parms;
-    char *str;
     char value[32];
     int val;
     int ret;
@@ -3372,8 +3397,6 @@ static int adev_set_parameters(struct audio_hw_device *dev, const char *kvpairs)
     if (ret >= 0) {
         char *snd_card_status = value+2;
         if (strstr(snd_card_status, "OFFLINE")) {
-            struct listnode *node;
-            struct audio_usecase *usecase;
             ALOGD("Received sound card OFFLINE status");
             set_snd_card_state(adev,SND_CARD_STATE_OFFLINE);
             //close compress sessions on OFFLINE status
@@ -3493,6 +3516,12 @@ static char* adev_get_parameters(const struct audio_hw_device *dev,
     int ret = 0;
 
     if (!query || !reply) {
+        if (reply) {
+            str_parms_destroy(reply);
+        }
+        if (query) {
+            str_parms_destroy(query);
+        }
         ALOGE("adev_get_parameters: failed to create query or reply");
         return NULL;
     }
@@ -3752,7 +3781,6 @@ static int adev_open_input_stream(struct audio_hw_device *dev,
     /* This stream could be for sound trigger lab,
        get sound trigger pcm if present */
     audio_extn_sound_trigger_check_and_get_session(in);
-    audio_extn_perf_lock_init();
 
     *stream_in = &in->stream;
     ALOGV("%s: exit", __func__);
@@ -3853,8 +3881,6 @@ static int period_size_is_plausible_for_low_latency(int period_size)
 static int adev_open(const hw_module_t *module, const char *name,
                      hw_device_t **device)
 {
-    int i, ret;
-
     ALOGD("%s: enter", __func__);
     if (strcmp(name, AUDIO_HARDWARE_INTERFACE) != 0) return -EINVAL;
 
@@ -3915,6 +3941,9 @@ static int adev_open(const hw_module_t *module, const char *name,
     list_init(&adev->usecase_list);
     adev->cur_wfd_channels = 2;
     adev->offload_usecases_state = 0;
+    adev->perf_lock_opts[0] = 0x101;
+    adev->perf_lock_opts[1] = 0x20E;
+    adev->perf_lock_opts_size = 2;
 
     pthread_mutex_init(&adev->snd_card_status.lock, (const pthread_mutexattr_t *) NULL);
     adev->snd_card_status.state = SND_CARD_STATE_OFFLINE;
@@ -4028,6 +4057,7 @@ static int adev_open(const hw_module_t *module, const char *name,
     if (adev->adm_init)
         adev->adm_data = adev->adm_init();
 
+    audio_extn_perf_lock_init();
     ALOGV("%s: exit", __func__);
     return 0;
 }
